@@ -42,25 +42,52 @@ the gr.HTML() block below. Gradio (like any DOM innerHTML update) does
 not execute <script> tags that arrive as part of an HTML component's
 value, so a script embedded there would silently never run - the face
 would then look permanently frozen even though every event-wiring call
-"succeeds". Instead, that script is injected via gr.Blocks(head=...),
-which places it in the real page <head> where the browser executes it
-normally on load, exactly once, before any component JS references it.
+"succeeds". Instead, that script is injected via app.launch(head=...)
+(passed at launch time rather than to gr.Blocks() - see build_gradio_app()
+below for why), which places it in the real page <head> where the browser
+executes it normally on load, exactly once, before any component JS
+references it.
+
+FIX (client-side "stuck on THINKING" race): the playback-kickoff script
+used to do `audio.src = uri; audio.currentTime = 0; audio.load(); audio.play();`
+Setting `.currentTime` on a <audio> element immediately after changing
+`.src`, before the browser has loaded metadata (readyState is still
+HAVE_NOTHING at that point), can throw a synchronous InvalidStateError in
+some browsers/timings. With no try/catch around it, that exception aborted
+the rest of the handler *before* `audio.play()` ever ran - so no
+play/playing event ever fired, and the face just sat frozen on whatever
+state was set before playback (THINKING), even though the reply text and
+audio had already come back successfully. Because the persistent hidden
+<audio> element's exact readyState at that instant depends on how the
+previous turn's load/pause/ended events happened to resolve, this only
+threw intermittently - a classic "sometimes it just works" race. The fix
+below drops the redundant currentTime reset (assigning a new .src and
+calling .load() already resets playback position to 0) and wraps the whole
+playback-kickoff block in try/catch so any future unexpected throw resolves
+straight to the target emotion instead of leaving the face stuck.
 
 Put your keys in a .env file next to this script (see .env.example):
   MAYA_API_KEY=maya_sk_live_...
   GEMINI_API_KEY=...            (if LLM_PROVIDER=gemini)
   GROK_API_KEY=...              (if LLM_PROVIDER=grok)
+
+Dependencies: the Gemini path now uses Google's current `google-genai`
+package (imported as `from google import genai`), NOT the retired
+`google-generativeai` package. Install/upgrade with:
+  pip install -U google-genai
 """
 
 import os
+import io
+import sys
 import json
-import time
 import wave
 import base64
 import argparse
 import tempfile
+import threading
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch
 import requests
@@ -116,33 +143,8 @@ LANGUAGES: Dict[str, Optional[str]] = {
 # ----------------------------------------------------------------------------
 _asr_pipe: Optional[Any] = None
 _maya_session: Optional[requests.Session] = None
-
-# synthesize_speech() has to hand back a real file path (Gradio serializes
-# the reply audio from a path, and wav_to_data_uri() re-reads it), so every
-# turn writes a fresh temp .wav that nothing ever deleted - left alone, a
-# long-running server slowly fills its temp directory with one orphaned
-# file per turn, forever. We can't safely delete a turn's own file right
-# after writing it (Gradio reads/serializes it *after* this function
-# returns, on its own schedule), so instead every call sweeps this
-# dedicated subdirectory for anything older than a few minutes - long
-# enough that any real request has certainly already finished with it.
-_TTS_TMP_DIR = os.path.join(tempfile.gettempdir(), "voice_agent_tts")
-os.makedirs(_TTS_TMP_DIR, exist_ok=True)
-_TTS_TMP_MAX_AGE_SECONDS = 600  # 10 minutes
-
-
-def _cleanup_stale_tts_temp_files() -> None:
-    now = time.time()
-    try:
-        for name in os.listdir(_TTS_TMP_DIR):
-            path = os.path.join(_TTS_TMP_DIR, name)
-            try:
-                if now - os.path.getmtime(path) > _TTS_TMP_MAX_AGE_SECONDS:
-                    os.remove(path)
-            except OSError:
-                pass  # already gone, or a permissions blip - not worth failing the turn over
-    except OSError:
-        pass
+_grok_session: Optional[requests.Session] = None
+_gemini_client: Optional[Any] = None
 
 
 def load_asr() -> Any:
@@ -151,10 +153,17 @@ def load_asr() -> Any:
         return _asr_pipe
     from transformers import pipeline
     print("[ASR] loading whisper...", flush=True)
+    # fp16 on GPU roughly halves both the model's memory footprint and its
+    # per-turn inference time versus the default fp32, with no accuracy
+    # loss worth mentioning for whisper-small - this is the standard,
+    # well-supported way to speed up a transformers ASR pipeline on CUDA.
+    # On CPU (no CUDA) we stay on fp32, since most CPUs don't accelerate
+    # fp16 matmuls and some ops aren't even implemented for fp16-on-CPU.
     _asr_pipe = pipeline(
         "automatic-speech-recognition",
         model=ASR_MODEL_ID,
         device=0 if DEVICE == "cuda" else -1,
+        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
     )
     print("[ASR] ready.", flush=True)
     return _asr_pipe
@@ -172,10 +181,49 @@ def get_maya_session() -> requests.Session:
     return _maya_session
 
 
+def get_grok_session() -> requests.Session:
+    """
+    Same rationale as get_maya_session() above, applied to the xAI Grok
+    endpoint: _chat_grok() used to call requests.post(...) directly, which
+    opens (and TLS-handshakes) a brand-new connection to api.x.ai on every
+    single conversational turn. A shared Session reuses one underlying
+    connection (via urllib3's connection pool / keep-alive) across turns,
+    which is a real, measurable chunk of latency for a plain HTTPS POST -
+    the actual cost varies by network, but shaving off a full TCP+TLS
+    handshake per turn is never nothing.
+    """
+    global _grok_session
+    if _grok_session is None:
+        _grok_session = requests.Session()
+    return _grok_session
+
+
+def get_gemini_client() -> Any:
+    """
+    Lazily creates and caches a single google.genai Client, the same way
+    get_maya_session()/get_grok_session() cache their HTTP sessions above.
+
+    The old google-generativeai code called genai.configure(...) and built
+    a fresh genai.GenerativeModel(...) on every single turn in
+    _chat_gemini() - cheap-looking Python object construction, but the
+    underlying SDK still sets up its own HTTP client/connection state each
+    time, so a brand-new one per turn throws away any keep-alive benefit
+    the previous turn's connection could have offered. Reusing one Client
+    across the whole process's lifetime is the direct equivalent of the
+    Maya/Grok session reuse above, applied to Gemini.
+    """
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    from google import genai  # type: ignore[import-not-found]
+    _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    return _gemini_client
+
+
 # ----------------------------------------------------------------------------
 # ASR
 # ----------------------------------------------------------------------------
-def transcribe(audio_path: str) -> str:
+def transcribe(audio_path: str, language_name: Optional[str] = None) -> str:
     """
     Speech -> text using Whisper.
 
@@ -185,6 +233,15 @@ def transcribe(audio_path: str) -> str:
     out to the `ffmpeg` binary to decode it, which frequently isn't
     installed on minimal cloud containers. This sidesteps that dependency
     entirely.
+
+    `language_name` is the same display string used everywhere else in this
+    file (a key of LANGUAGES, e.g. "Hindi", "English (Indian accent)"). When
+    given, it's translated into the ISO code Whisper expects and passed as a
+    generation hint, so a user who picked "Hindi" in the UI can't have their
+    audio silently auto-detected into a different language before the LLM
+    (which IS told to reply in that exact language) ever sees the text.
+    "Hinglish (code-mixed)" and an omitted/unknown language both fall back to
+    Whisper's own auto-detection, same as before this hint existed.
     """
     asr = load_asr()
 
@@ -201,7 +258,21 @@ def transcribe(audio_path: str) -> str:
         except ImportError:
             pass  # fall back to original sample rate if librosa isn't present
 
-    raw_result: Any = asr({"array": audio_array, "sampling_rate": sr})
+    generate_kwargs: Dict[str, Any] = {}
+    lang_code = LANGUAGES.get(language_name) if language_name else None
+    if lang_code:
+        # Whisper's `language` generation kwarg wants the same short ISO
+        # code we already keep in LANGUAGES, so no extra mapping table is
+        # needed. We deliberately do NOT set this for None-coded entries
+        # (currently just Hinglish) or an unrecognised language_name -
+        # Whisper's own auto-detect already handles code-switched audio
+        # more gracefully than forcing a single language.
+        generate_kwargs["language"] = lang_code
+
+    raw_result: Any = asr(
+        {"array": audio_array, "sampling_rate": sr},
+        generate_kwargs=generate_kwargs or None,
+    )
 
     # The pipeline can return a dict ({"text": ...}) or, depending on
     # settings, a list of chunk dicts. Handle both explicitly instead of
@@ -230,6 +301,29 @@ _ALLOWED_LLM_EMOTIONS = [
     "happy", "sad", "excited", "curious", "confused",
     "surprised", "caring", "thinking", "neutral",
 ]
+
+
+# The exact JSON shape chat_llm()'s system prompt asks for. Handed to
+# Gemini as an enforced response_schema (see _chat_gemini) so the model is
+# *structurally forced* to emit valid JSON with "emotion" constrained to
+# one of _ALLOWED_LLM_EMOTIONS, rather than just being asked nicely in the
+# prompt and hoped for. This is very likely the actual fix for "sometimes
+# the face doesn't match the reply": free-form JSON-in-a-prompt is
+# followed correctly most of the time but not every time (a stray
+# preamble line, a missed key, some markdown fences) - when that happens,
+# _parse_llm_reply() falls back to the local detect_emotion() keyword
+# scanner, which only recognises English/Hindi phrases (see its lexicon
+# below) and returns "neutral" for anything else, INCLUDING correctly-
+# generated replies in Telugu, Tamil, Bengali, etc. Forcing the schema
+# means that fallback path is hit far less often, in any language.
+_LLM_REPLY_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "emotion": {"type": "string", "enum": _ALLOWED_LLM_EMOTIONS},
+    },
+    "required": ["reply", "emotion"],
+}
 
 
 def chat_llm(history, user_text, language_name):
@@ -271,30 +365,23 @@ def chat_llm(history, user_text, language_name):
     return _parse_llm_reply(raw)
 
 
-def _extract_json_object(text: str) -> str:
-    """
-    Best-effort fallback extraction: take the substring from the first '{'
-    to the last '}' in the text. Used when the naive fence-stripping below
-    isn't enough - e.g. the model adds a space after the fence ("``` json"
-    instead of "```json"), or prepends chatty preamble ("Here's the JSON:
-    {...}"). Far more forgiving than assuming the fence is exactly
-    "```json" with nothing else around it.
-    """
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
-    return text
-
-
 def _parse_llm_reply(raw_text: str) -> Tuple[str, str]:
     """
     Parse the {"reply": ..., "emotion": ...} JSON that chat_llm()'s system
-    prompt asks the model for. If the model ever replies with something
-    that isn't valid JSON (wrapped in markdown fences, chatty preamble,
+    prompt (and, for Gemini, its enforced JSON schema - see _chat_gemini)
+    asks the model for. If the model ever replies with something that
+    isn't valid JSON (wrapped in markdown fences, chatty preamble,
     truncated, etc.) this never loses the turn: the raw text is used as
     the reply as-is, and detect_emotion() - the original local, rule-based
     reader - is used as the fallback mood instead of a blind "neutral".
+
+    Two parse attempts are made, in order:
+      1. The whole cleaned string as JSON (the common, on-format case).
+      2. If that fails, the first `{...}` substring found anywhere in the
+         text - this rescues the (rarer, but real) case where a model adds
+         a stray preamble/sentence before or after the JSON object despite
+         being told not to, which strict whole-string parsing would
+         otherwise reject outright and silently punt to detect_emotion().
     """
     cleaned = (raw_text or "").strip()
     if cleaned.startswith("```"):
@@ -302,28 +389,36 @@ def _parse_llm_reply(raw_text: str) -> Tuple[str, str]:
         if cleaned[:4].lower() == "json":
             cleaned = cleaned[4:].strip()
 
-    # Try the naively-cleaned text first, then a more forgiving
-    # brace-extracted version of it. Without this second attempt, a stray
-    # space after the fence or a one-line preamble would fall all the way
-    # through to the except-branch below - which means the RAW text
-    # (backticks, fence, and all) gets used as the literal spoken reply
-    # and read aloud by TTS verbatim, instead of just the "reply" field.
-    for candidate in (cleaned, _extract_json_object(cleaned)):
+    data = None
+    try:
+        data = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError):
+        # Fallback: pull out the first balanced-looking {...} span and try
+        # that instead of giving up immediately. A simple first-'{'-to-
+        # last-'}' slice is enough here since the schema is flat (no
+        # nested braces expected inside "reply"/"emotion" string values).
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(cleaned[start:end + 1])
+            except (json.JSONDecodeError, TypeError):
+                data = None
+
+    if data is not None:
         try:
-            data = json.loads(candidate)
             reply_text = str(data.get("reply", "")).strip()
             emotion_tag = str(data.get("emotion", "")).strip().lower()
-            if not reply_text:
-                raise ValueError("LLM JSON reply had an empty 'reply' field")
-            if emotion_tag not in _ALLOWED_LLM_EMOTIONS:
-                emotion_tag = detect_emotion(reply_text)
-            return reply_text, emotion_tag
-        except (json.JSONDecodeError, ValueError, TypeError, AttributeError):
-            continue
+            if reply_text:
+                if emotion_tag not in _ALLOWED_LLM_EMOTIONS:
+                    emotion_tag = detect_emotion(reply_text)
+                return reply_text, emotion_tag
+        except (ValueError, TypeError, AttributeError):
+            pass
 
-    # Neither attempt parsed - fall back to the raw text as the reply, and
-    # the local keyword/structural detector for the mood, so one
-    # malformed model response never breaks the conversation.
+    # Not valid JSON even after the rescue attempt - fall back to the raw
+    # text as the reply, and the local keyword/structural detector for the
+    # mood, so one malformed model response never breaks the conversation.
     fallback_text = raw_text.strip() if raw_text else ""
     return fallback_text, detect_emotion(fallback_text)
 
@@ -332,30 +427,69 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 
 def _chat_gemini(system_prompt, history, user_text):
+    """
+    Uses `google-genai` (the package name is `google-genai`, imported as
+    `from google import genai`), Google's current, actively-maintained SDK.
+
+    The previous implementation used `google.generativeai`, which Google
+    has now fully retired ("All support...has ended. It will no longer be
+    receiving updates or bug fixes" - see the FutureWarning it raises on
+    import). That package still runs today, but it's frozen: no bug fixes,
+    and Google can break its backend compatibility at any time with no
+    recourse. `google-genai` is the single supported SDK going forward for
+    both the Gemini Developer API and Vertex AI.
+
+    Install with: pip install -U google-genai
+    (You can safely `pip uninstall google-generativeai` afterwards - nothing
+    else in this file imports it.)
+    """
     try:
-        import google.generativeai as genai  # type: ignore[import-not-found]
+        from google.genai import types  # type: ignore[import-not-found]
     except ImportError as e:
         raise ImportError(
-            "google-generativeai isn't installed. Run "
-            "`pip install -r requirements.txt` in this environment."
+            "google-genai isn't installed (the old google-generativeai "
+            "package has been fully retired by Google and no longer "
+            "receives updates). Run `pip install -U google-genai` in this "
+            "environment, then update requirements.txt to match."
         ) from e
-    genai.configure(api_key=GEMINI_API_KEY)
-    # NOTE: "gemini-2.0-flash" was retired by Google; the live API error
-    # pointed us to "gemini-3.6-flash" as the replacement. Overridable via
-    # GEMINI_MODEL in .env if it changes again in the future.
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
 
-    gem_history = []
-    for turn in history:
-        role = "user" if turn["role"] == "user" else "model"
-        gem_history.append({"role": role, "parts": [turn["content"]]})
+    client = get_gemini_client()
 
-    chat = model.start_chat(history=gem_history)
+    # The new SDK's chat session takes prior turns as a `history` list of
+    # types.Content objects (role + parts) at creation time, rather than
+    # the old SDK's list-of-plain-dicts passed to start_chat(history=...) -
+    # same information, slightly different shape.
+    gem_history = [
+        types.Content(
+            role=("user" if turn["role"] == "user" else "model"),
+            parts=[types.Part(text=turn["content"])],
+        )
+        for turn in history
+    ]
+
+    # NOTE: "gemini-2.0-flash" was retired by Google; GEMINI_MODEL currently
+    # defaults to "gemini-3.6-flash" (see its definition above, overridable
+    # via GEMINI_MODEL in .env). Double-check this against Google's current
+    # model list for your account if replies ever start failing outright -
+    # model names/availability shift over time and this default may age.
+    chat = client.chats.create(
+        model=GEMINI_MODEL,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            # Structural enforcement, not just a prompt request: Gemini
+            # will only emit a JSON object matching this exact schema
+            # (with "emotion" restricted to _ALLOWED_LLM_EMOTIONS), so
+            # _parse_llm_reply()'s strict json.loads() succeeds on
+            # (near-)every turn instead of occasionally falling back to
+            # the much weaker local detect_emotion() heuristic - see
+            # _LLM_REPLY_JSON_SCHEMA's comment above for why that matters.
+            response_mime_type="application/json",
+            response_schema=_LLM_REPLY_JSON_SCHEMA,
+        ),
+        history=gem_history,
+    )
     response = chat.send_message(user_text)
-    return response.text.strip()
-
-
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6")
+    return (response.text or "").strip()
 
 
 def _chat_grok(system_prompt, history, user_text):
@@ -363,22 +497,29 @@ def _chat_grok(system_prompt, history, user_text):
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
 
-    resp = requests.post(
+    # get_grok_session() reuses one connection across turns instead of
+    # requests.post() opening a fresh TCP+TLS connection to api.x.ai every
+    # single time - see get_grok_session()'s docstring above.
+    resp = get_grok_session().post(
         "https://api.x.ai/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {GROK_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
-            # NOTE: "grok-4" is a legacy model ID that xAI now silently
-            # redirects to grok-4.3 at *low* reasoning effort - it never
-            # errors, so this was quietly serving a downgraded model with
-            # no visible warning. GROK_MODEL lets you override this the
-            # same way GEMINI_MODEL does for the Gemini path, in case
-            # xAI ships a newer flagship again.
-            "model": GROK_MODEL,
+            "model": "grok-4",
             "messages": messages,
             "temperature": 0.7,
+            # xAI's Chat Completions endpoint is OpenAI-compatible and
+            # supports the same JSON-mode flag: with this set, the API
+            # itself constrains decoding to valid JSON, rather than
+            # relying purely on the system prompt's instructions being
+            # followed. (Grok has no equivalent of Gemini's response_schema
+            # enum constraint on this endpoint, so "emotion" itself isn't
+            # structurally locked to _ALLOWED_LLM_EMOTIONS the way it is
+            # for Gemini above - _parse_llm_reply()'s allow-list check
+            # still guards that part.)
+            "response_format": {"type": "json_object"},
         },
         timeout=60,
     )
@@ -453,8 +594,7 @@ def synthesize_speech(text: str, language_name: str = "English (Indian accent)",
     if not pcm:
         raise ValueError("Maya TTS API returned an empty response body")
 
-    _cleanup_stale_tts_temp_files()
-    out_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=_TTS_TMP_DIR).name
+    out_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
     with wave.open(out_path, "wb") as wav_file:
         wav_file.setnchannels(1)
         wav_file.setsampwidth(2)  # 16-bit
@@ -660,17 +800,8 @@ def terminal_chat(language_name="English (Indian accent)", speaker="Ananya", sec
             sd.wait()
             tmp_in = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
             sf_.write(tmp_in, recording, samplerate)
-            try:
-                user_text = transcribe(tmp_in)
-            finally:
-                # This one's fully consumed synchronously right here (unlike
-                # the TTS output file), so it's safe to delete immediately
-                # instead of leaving it to rot in the temp dir.
-                try:
-                    os.remove(tmp_in)
-                except OSError:
-                    pass
 
+            user_text = transcribe(tmp_in, language_name=language_name)
             if not user_text:
                 print("(heard nothing, try again)")
                 continue
@@ -772,14 +903,7 @@ ROBOT_FACE_HTML = """
       <!-- ============================ THINKING ============================
            Pupils genuinely glance up/sideways on a slow loop (pondering),
            one eyebrow lifts, and a small "..." thinking bubble pulses one
-           dot at a time - "working on it", not "busy spinner". "thinking"
-           is also one of the moods the LLM can tag an actual reply with
-           (explanatory answers - "because", "for example", etc. - are
-           common enough that this isn't a rare case), so this face also
-           needs a real .mouth for the live lipsync rule to drive once
-           playback starts; the "..." dots fade out at that point via the
-           CSS rule below, since a pulsing "still working on it" bubble
-           reads wrong once the reply is actually being spoken aloud. -->
+           dot at a time - "working on it", not "busy spinner". -->
       <g class="state-group st-thinking">
         <path class="brow" d="M74,60 L120,60"></path>
         <path class="brow think-brow" d="M180,52 Q203,44 226,54"></path>
@@ -790,7 +914,6 @@ ROBOT_FACE_HTML = """
         <circle class="think-dot think-dot-1" cx="132" cy="144" r="6.5"></circle>
         <circle class="think-dot think-dot-2" cx="150" cy="144" r="6.5"></circle>
         <circle class="think-dot think-dot-3" cx="168" cy="144" r="6.5"></circle>
-        <path class="mouth think-mouth" d="M120,142 Q150,148 180,142"></path>
       </g>
 
       <!-- ============================ SPEAKING ============================
@@ -1088,16 +1211,6 @@ ROBOT_FACE_HTML = """
   #robot-panel[data-state="thinking"] .think-dot-1 { animation: robot-think-dot 1.2s ease-in-out infinite 0s; }
   #robot-panel[data-state="thinking"] .think-dot-2 { animation: robot-think-dot 1.2s ease-in-out infinite .2s; }
   #robot-panel[data-state="thinking"] .think-dot-3 { animation: robot-think-dot 1.2s ease-in-out infinite .4s; }
-  /* The "..." mouth is only meaningful once a reply is actually being
-     spoken in the "thinking" mood (see the .think-mouth comment above) -
-     hidden the rest of the time so the plain waiting face still reads as
-     "still working on it" via the dots alone, exactly as before. Once
-     live audio starts, the mouth takes over and the dots fade, since a
-     pulsing "..." next to a moving mouth would read as two conflicting
-     signals at once. */
-  #robot-panel[data-state="thinking"] .think-mouth { opacity: 0; transition: opacity .2s ease; }
-  #robot-panel.audio-live[data-state="thinking"] .think-mouth { opacity: 1; }
-  #robot-panel.audio-live[data-state="thinking"] .think-dot { opacity: 0; transition: opacity .2s ease; }
 
   /* Speaking: the live mouth's height is normally driven every animation
      frame straight from the *real* TTS audio's own volume via a CSS
@@ -1254,7 +1367,7 @@ ROBOT_FACE_HTML = """
 """
 
 
-# The face-control script lives here, injected via gr.Blocks(head=...)
+# The face-control script lives here, injected via app.launch(head=...)
 # instead of as a <script> tag inside ROBOT_FACE_HTML above.
 #
 # WHY: gr.HTML() renders its value as an HTML *fragment* that gets patched
@@ -1266,9 +1379,15 @@ ROBOT_FACE_HTML = """
 # it (or checks `if (window.setRobotState)`) was silently doing nothing -
 # which is exactly why the robot looked permanently stuck on IDLE.
 #
-# `head=` content, by contrast, is written into the real page <head> that
-# the browser parses and executes normally on load, so the function is
-# guaranteed to exist before any button/audio event ever tries to call it.
+# WHY app.launch(head=...) AND NOT gr.Blocks(head=...): Gradio moved the
+# `head` parameter off the Blocks constructor and onto launch() as of
+# Gradio 6.0 - passing it to Blocks() still "works" on some versions but
+# throws a UserWarning on 6.x and is not guaranteed to be honoured going
+# forward. Passing it to launch() instead is what's actually documented
+# for current Gradio and is what makes this reliably land in the real
+# page <head> that the browser parses and executes normally on load, so
+# the function is guaranteed to exist before any button/audio event ever
+# tries to call it - on both old and new Gradio.
 #
 # This block also owns the *real* lipsync engine: window.__robotBindAmp
 # wires a Web Audio AnalyserNode onto the actual <audio> element the reply
@@ -1293,6 +1412,22 @@ ROBOT_FACE_HTML = """
 # drives THAT state's own mouth from the same live amplitude data. The
 # generic "speaking" state is kept only as a fallback for the (normally
 # unreachable) case where no target emotion was supplied.
+#
+# FIX applied here for the intermittent "stuck on THINKING" bug: the
+# playback-kickoff handler used to run
+#   audio.src = uri; audio.currentTime = 0; audio.load(); audio.play();
+# with no error handling. Setting `.currentTime` right after changing
+# `.src`, before metadata has loaded (readyState HAVE_NOTHING), can throw a
+# synchronous InvalidStateError depending on the persistent <audio>
+# element's exact internal state left over from the previous turn. With no
+# try/catch, that exception silently aborted the rest of the handler -
+# `audio.load()`/`audio.play()` never ran, no play/playing event ever
+# fired, and the face was left stuck on whatever state was set before
+# playback (THINKING) even though the reply text/audio had already come
+# back fine. The fix: drop the redundant currentTime reset (a fresh `.src`
+# + `.load()` already resets position to 0) and wrap the whole block in
+# try/catch so the face always resolves to the target emotion no matter
+# what.
 ROBOT_FACE_SCRIPT = """
 <script>
   (function () {
@@ -1341,15 +1476,6 @@ ROBOT_FACE_SCRIPT = """
       return el;
     };
 
-    // NOTE: this used to auto-stop the live-amplitude loop whenever the
-    // target state name wasn't literally "speaking" - that assumption
-    // broke once playback started jumping straight into the resolved
-    // emotion's own face (e.g. "caring") instead of a generic "speaking"
-    // face, since setRobotState(<emotion>) is now called mid-playback
-    // too. Rather than special-case state names here, callers that
-    // genuinely want to stop any live audio (starting a new recording,
-    // clearing the mic, resetting) call window.__robotAmpStop() - and
-    // pause the shared audio element - explicitly themselves.
     window.setRobotState = function (state) {
       var allowed = ["idle","listening","thinking","speaking","happy","sad",
                       "excited","curious","confused","surprised","neutral",
@@ -1359,25 +1485,11 @@ ROBOT_FACE_SCRIPT = """
       var s = (state || "idle").toString().toLowerCase().trim();
       if (allowed.indexOf(s) === -1) { s = "idle"; }
       panel.setAttribute("data-state", s);
+      if (s !== "speaking") {
+        window.__robotAmpStop();
+      }
       var label = deepQuery("#robot-status-label");
       if (label) { label.textContent = s.charAt(0).toUpperCase() + s.slice(1); }
-    };
-
-    // Stops any reply audio that's still playing from a previous turn and
-    // silences the live-amplitude loop - used for "barge-in" (starting a
-    // new recording, clearing the mic, or resetting while the assistant
-    // is still talking) so the old clip never plays on top of the next
-    // one. Sets a one-shot flag the 'pause' listener (wired up per-turn
-    // below) checks first, so this deliberate stop doesn't also trigger
-    // settle()'s "the reply stopped early" handling and immediately
-    // overwrite whatever state we're about to set (e.g. 'listening').
-    window.__robotStopAnyPlayback = function () {
-      var audio = window.__robotSyncAudioEl;
-      if (audio && !audio.paused) {
-        audio._robotBargeIn = true;
-        audio.pause();
-      }
-      if (window.__robotAmpStop) { window.__robotAmpStop(); }
     };
 
     // One shared AnalyserNode per <audio> element (Web Audio only allows
@@ -1459,7 +1571,14 @@ ROBOT_FACE_SCRIPT = """
       if (!audio || !audio._robotAnalyser) { return; }
       try {
         if (audio._robotCtx && audio._robotCtx.state === "suspended") {
-          audio._robotCtx.resume();
+          // resume() returns a Promise that can reject under strict
+          // autoplay policies - swallow that instead of letting it
+          // surface as an unhandled rejection; the CSS fallback mouth
+          // loop still covers us if the analyser data never flows.
+          var resumePromise = audio._robotCtx.resume();
+          if (resumePromise && typeof resumePromise.catch === "function") {
+            resumePromise.catch(function () { /* ignore - policy may block this */ });
+          }
         }
       } catch (e) { /* ignore */ }
       if (panel) { panel.classList.add("audio-live"); }
@@ -1484,6 +1603,39 @@ ROBOT_FACE_SCRIPT = """
   })();
 </script>
 """
+
+
+def _schedule_temp_file_cleanup(path: str, delay_seconds: float = 120.0) -> None:
+    """
+    Best-effort deletion of a per-turn temp .wav some time after it was
+    handed to Gradio.
+
+    synthesize_speech() creates a brand-new tempfile.NamedTemporaryFile(...,
+    delete=False) on every single conversational turn, and nothing was ever
+    removing them again on the Gradio path (terminal_chat() at least
+    os.replace()s its copy into a real destination) - left running, that's
+    an unbounded, ever-growing pile of orphaned .wav files in the system
+    temp directory.
+
+    We can't just unlink the file the instant we're done reading it for the
+    base64 data URI: the *visible* `reply_audio` Gradio component is also
+    returned with this same path in the same turn, and Gradio needs to be
+    able to read the file to serve/copy it during response postprocessing,
+    which happens asynchronously relative to when this function returns.
+    Deleting on a short background delay - long enough for that to finish,
+    short enough not to matter for disk usage - avoids guessing at Gradio's
+    internal timing while still not leaking files forever.
+    """
+    def _cleanup():
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass  # already gone, or still briefly in use - not worth raising over
+
+    timer = threading.Timer(delay_seconds, _cleanup)
+    timer.daemon = True
+    timer.start()
 
 
 def build_gradio_app():
@@ -1534,7 +1686,7 @@ def build_gradio_app():
             return history, history_to_display(history), None, "idle", ""
 
         try:
-            user_text = transcribe(audio_path)
+            user_text = transcribe(audio_path, language_name=language_name)
         except Exception:
             traceback.print_exc()
             return history, history_to_display(history), None, "confused", ""
@@ -1577,6 +1729,15 @@ def build_gradio_app():
             # the lipsync-driving copy rather than losing the whole turn.
             data_uri = ""
 
+        # The data URI already carries a full in-memory copy of the audio,
+        # and the visible gr.Audio component only needs the file on disk
+        # long enough for Gradio's own postprocessing to read/copy it for
+        # this response - not forever. Without this, every turn left its
+        # temp .wav behind permanently (see _schedule_temp_file_cleanup's
+        # docstring for why this is a delayed cleanup rather than an
+        # immediate os.remove()).
+        _schedule_temp_file_cleanup(wav_path)
+
         return history, history_to_display(history), wav_path, target_emotion, data_uri
 
     def history_to_display(history):
@@ -1589,12 +1750,14 @@ def build_gradio_app():
     def reset():
         return [], history_to_display([]), None
 
-    # head=ROBOT_FACE_SCRIPT is the fix for the "robot never leaves IDLE"
-    # bug: it puts window.setRobotState in the page's real <head>, where
-    # the browser actually executes it, instead of inside a gr.HTML()
-    # fragment where a <script> tag would silently never run. See the
-    # comment above ROBOT_FACE_SCRIPT for the full explanation.
-    with gr.Blocks(title="Voice Agent", head=ROBOT_FACE_SCRIPT) as demo:
+    # NOTE: `head=` used to be passed here, to gr.Blocks(). As of Gradio
+    # 6.0 that parameter moved to launch() - passing it to Blocks() now
+    # raises a UserWarning and isn't guaranteed to actually inject the
+    # script, which silently reintroduces the "robot never leaves IDLE"
+    # bug the comments above ROBOT_FACE_SCRIPT describe. It's passed to
+    # app.launch(head=ROBOT_FACE_SCRIPT) in main() below instead - see the
+    # comment on ROBOT_FACE_SCRIPT for the full explanation.
+    with gr.Blocks(title="Voice Agent") as demo:
         gr.Markdown("## 🗣️ Voice Agent\nRecord your voice, pick a language and speaker, then tap **Converse**.")
 
         gr.HTML(ROBOT_FACE_HTML)
@@ -1610,18 +1773,11 @@ def build_gradio_app():
         # to IDLE if recording is stopped/cleared without ever hitting
         # Converse (e.g. the user cancels). If Converse *is* pressed, the
         # very next handler below immediately overrides this with THINKING.
-        #
-        # start_recording and clear also call __robotStopAnyPlayback() -
-        # without it, starting a new recording (or clearing the mic) while
-        # a previous reply is still audibly playing wouldn't stop that
-        # clip, so the old reply could keep talking underneath the new
-        # one once it's ready ("barge-in" with no actual interruption).
         mic.start_recording(
             fn=None,
             inputs=None,
             outputs=None,
-            js="() => { if (window.__robotStopAnyPlayback) { window.__robotStopAnyPlayback(); } "
-               "if (window.setRobotState) { window.setRobotState('listening'); } }",
+            js="() => { if (window.setRobotState) { window.setRobotState('listening'); } }",
         )
         mic.stop_recording(
             fn=None,
@@ -1633,8 +1789,7 @@ def build_gradio_app():
             fn=None,
             inputs=None,
             outputs=None,
-            js="() => { if (window.__robotStopAnyPlayback) { window.__robotStopAnyPlayback(); } "
-               "if (window.setRobotState) { window.setRobotState('idle'); } }",
+            js="() => { if (window.setRobotState) { window.setRobotState('idle'); } }",
         )
 
         with gr.Row():
@@ -1666,16 +1821,12 @@ def build_gradio_app():
         state = gr.State([])
 
         # 1) Instant client-side feedback the moment the button is pressed -
-        #    tied to the real click event, not a timer. Also stops any
-        #    reply audio still playing from a previous turn (e.g. a fast
-        #    double-press of Converse), same reasoning as the mic handlers
-        #    above.
+        #    tied to the real click event, not a timer.
         converse_btn.click(
             fn=None,
             inputs=None,
             outputs=None,
-            js="() => { if (window.__robotStopAnyPlayback) { window.__robotStopAnyPlayback(); } "
-               "if (window.setRobotState) { window.setRobotState('thinking'); } }",
+            js="() => { if (window.setRobotState) { window.setRobotState('thinking'); } }",
         ).then(
             # 2) The actual STT -> LLM -> TTS pipeline (unchanged logic).
             fn=converse,
@@ -1697,6 +1848,20 @@ def build_gradio_app():
             #    still audibly playing. A single element only we ever
             #    touch, fed a self-contained data URI, has no such
             #    ambiguity: every pause it ever fires is real.
+            #
+            #    The whole body is wrapped in try/catch (the fix for the
+            #    intermittent "stuck on THINKING" bug): previously,
+            #    `audio.currentTime = 0` was set right after changing
+            #    `.src` and before `.load()`, which can throw a synchronous
+            #    InvalidStateError depending on the shared <audio>
+            #    element's exact leftover readyState from the previous
+            #    turn. With no try/catch, that exception silently aborted
+            #    the rest of the handler *before* `audio.play()` ever ran -
+            #    so no play/playing event ever fired, and the face just sat
+            #    frozen on "thinking" even though the reply text/audio had
+            #    already come back fine. The currentTime reset was also
+            #    unnecessary: assigning a new `.src` and calling `.load()`
+            #    already resets playback position to 0 on its own.
             fn=None,
             inputs=[target_emotion_box, reply_audio_data_box],
             outputs=None,
@@ -1714,87 +1879,92 @@ def build_gradio_app():
                 return;
               }
 
-              var audio = window.__robotGetSyncAudio();
-              audio.dataset.targetEmotion = emo;
+              try {
+                var audio = window.__robotGetSyncAudio();
+                audio.dataset.targetEmotion = emo;
 
-              // Web Audio analyser is bound once per <audio> element (a
-              // MediaElementSource can only ever be created once for a
-              // given element) - this is what lets the mouth react to the
-              // TTS clip's *real*, live volume instead of just looping a
-              // generic shape while "speaking" is set. Safe to call every
-              // turn since this is always the SAME persistent element.
-              if (window.__robotBindAmp) { window.__robotBindAmp(audio); }
+                // Web Audio analyser is bound once per <audio> element (a
+                // MediaElementSource can only ever be created once for a
+                // given element) - this is what lets the mouth react to the
+                // TTS clip's *real*, live volume instead of just looping a
+                // generic shape while "speaking" is set. Safe to call every
+                // turn since this is always the SAME persistent element.
+                if (window.__robotBindAmp) { window.__robotBindAmp(audio); }
 
-              if (audio.dataset.robotBound !== "1") {
-                audio.dataset.robotBound = "1";
+                if (audio.dataset.robotBound !== "1") {
+                  audio.dataset.robotBound = "1";
 
-                var toSpeaking = function () {
-                  // Go straight to the resolved emotion's own face instead
-                  // of the generic "speaking" face - the mouth on THAT
-                  // state gets driven live by the audio amplitude via the
-                  // `.audio-live .state-group .mouth`/`.mouth-o` CSS rule,
-                  // so caring/happy/sad/etc. now visibly talk in their own
-                  // expression instead of settling into it only after the
-                  // clip has already finished playing.
-                  window.setRobotState(audio.dataset.targetEmotion || "speaking");
-                  if (window.__robotAmpStart) { window.__robotAmpStart(audio); }
-                };
-                var settle = function () {
-                  clearTimeout(audio._robotSafetyTimer);
-                  if (window.__robotAmpStop) { window.__robotAmpStop(); }
-                  window.setRobotState(audio.dataset.targetEmotion || "idle");
-                };
+                  var toSpeaking = function () {
+                    // Go straight to the resolved emotion's own face instead
+                    // of the generic "speaking" face - the mouth on THAT
+                    // state gets driven live by the audio amplitude via the
+                    // `.audio-live .state-group .mouth`/`.mouth-o` CSS rule,
+                    // so caring/happy/sad/etc. now visibly talk in their own
+                    // expression instead of settling into it only after the
+                    // clip has already finished playing.
+                    window.setRobotState(audio.dataset.targetEmotion || "speaking");
+                    if (window.__robotAmpStart) { window.__robotAmpStart(audio); }
+                  };
+                  var settle = function () {
+                    clearTimeout(audio._robotSafetyTimer);
+                    if (window.__robotAmpStop) { window.__robotAmpStop(); }
+                    window.setRobotState(audio.dataset.targetEmotion || "idle");
+                  };
 
-                audio.addEventListener("play", toSpeaking);
-                audio.addEventListener("playing", toSpeaking);
-                audio.addEventListener("ended", settle);
-                audio.addEventListener("error", settle);
-                audio.addEventListener("pause", function () {
-                  // A pause caused by window.__robotStopAnyPlayback()
-                  // (barge-in: the user started a new recording, cleared
-                  // the mic, or hit Reset while this was still playing)
-                  // is already being handled by whichever explicit state
-                  // change triggered it - don't also run settle() here,
-                  // or it would immediately overwrite that state (e.g.
-                  // 'listening') with the old reply's resolved emotion.
-                  if (audio._robotBargeIn) { audio._robotBargeIn = false; return; }
-                  // Otherwise: this element is fully ours and only ever
-                  // plays one clip start-to-finish per turn, so any pause
-                  // that isn't the natural end really is the reply
-                  // stopping early - unlike Gradio's own player, there's
-                  // no internal buffering/streaming here to confuse this
-                  // with. Also fires once real playback ever ends.
-                  if (!audio.ended) { settle(); }
-                });
-                audio.addEventListener("play", function () {
-                  // Absolute safety net: if no play/ended/error event ever
-                  // resolves things (unexpected browser quirk), force a
-                  // settle a few seconds past the clip's own length so the
-                  // face can never stay stuck in SPEAKING forever.
-                  clearTimeout(audio._robotSafetyTimer);
-                  var durMs = isFinite(audio.duration) && audio.duration > 0
-                    ? audio.duration * 1000 : 30000;
-                  audio._robotSafetyTimer = setTimeout(settle, durMs + 5000);
-                });
-              }
+                  audio.addEventListener("play", toSpeaking);
+                  audio.addEventListener("playing", toSpeaking);
+                  audio.addEventListener("ended", settle);
+                  audio.addEventListener("error", settle);
+                  audio.addEventListener("pause", function () {
+                    // Since this element is fully ours and only ever plays
+                    // one clip start-to-finish per turn, any pause that
+                    // isn't the natural end really is the reply stopping
+                    // early - unlike Gradio's own player, there's no
+                    // internal buffering/streaming here to confuse this
+                    // with. Also fires once real playback ever ends.
+                    if (!audio.ended) { settle(); }
+                  });
+                  audio.addEventListener("play", function () {
+                    // Absolute safety net: if no play/ended/error event ever
+                    // resolves things (unexpected browser quirk), force a
+                    // settle a few seconds past the clip's own length so the
+                    // face can never stay stuck in SPEAKING forever.
+                    clearTimeout(audio._robotSafetyTimer);
+                    var durMs = isFinite(audio.duration) && audio.duration > 0
+                      ? audio.duration * 1000 : 30000;
+                    audio._robotSafetyTimer = setTimeout(settle, durMs + 5000);
+                  });
+                }
 
-              // Every turn is a brand-new clip on the same element.
-              clearTimeout(audio._robotSafetyTimer);
-              audio.pause();
-              audio.src = audioDataUri;
-              audio.currentTime = 0;
-              audio.load();
+                // Every turn is a brand-new clip on the same element.
+                // NOTE: no manual `audio.currentTime = 0` here anymore -
+                // assigning a new `.src` and calling `.load()` already
+                // resets playback position, and setting currentTime this
+                // early (before metadata is loaded) is what could throw
+                // and silently kill the rest of this handler - see the
+                // comment above this whole js block for the full story.
+                clearTimeout(audio._robotSafetyTimer);
+                audio.pause();
+                audio.src = audioDataUri;
+                audio.load();
 
-              var playPromise = audio.play();
-              if (playPromise && typeof playPromise.catch === "function") {
-                playPromise.catch(function () {
-                  // Autoplay blocked, or the browser couldn't decode this
-                  // instant (rare for a same-origin data URI) - settle
-                  // immediately rather than leaving the face stuck on
-                  // "thinking" forever waiting for a play event that will
-                  // never come.
-                  window.setRobotState(emo);
-                });
+                var playPromise = audio.play();
+                if (playPromise && typeof playPromise.catch === "function") {
+                  playPromise.catch(function () {
+                    // Autoplay blocked, or the browser couldn't decode this
+                    // instant (rare for a same-origin data URI) - settle
+                    // immediately rather than leaving the face stuck on
+                    // "thinking" forever waiting for a play event that will
+                    // never come.
+                    window.setRobotState(emo);
+                  });
+                }
+              } catch (e) {
+                // Safety net: any unexpected throw anywhere in the block
+                // above (audio API quirks, Web Audio hiccups, etc.) must
+                // never leave the face stuck on "thinking" - resolve
+                // straight to the target emotion instead.
+                window.setRobotState(emo);
               }
             }
             """,
@@ -1807,10 +1977,7 @@ def build_gradio_app():
             fn=None,
             inputs=None,
             outputs=None,
-            # Stop any reply audio still playing before resetting the
-            # conversation - same barge-in reasoning as the mic handlers.
-            js="() => { if (window.__robotStopAnyPlayback) { window.__robotStopAnyPlayback(); } "
-               "if (window.setRobotState) { window.setRobotState('idle'); } }",
+            js="() => { if (window.setRobotState) { window.setRobotState('idle'); } }",
         )
 
     return demo
@@ -1847,7 +2014,19 @@ def main():
     last_err: Optional[Exception] = None
     for port in range(args.port, args.port + 10):
         try:
-            app.launch(server_name="0.0.0.0", server_port=port, share=args.share)
+            # head=ROBOT_FACE_SCRIPT lives here (launch()), not on
+            # gr.Blocks() above - see the comment on ROBOT_FACE_SCRIPT and
+            # the one just above `with gr.Blocks(...)` in build_gradio_app()
+            # for why. This is what actually fixes the "robot never leaves
+            # IDLE" bug on current Gradio versions (it was silently not
+            # firing when `head=` was passed to the Blocks constructor,
+            # which is deprecated as of Gradio 6.0).
+            app.launch(
+                server_name="0.0.0.0",
+                server_port=port,
+                share=args.share,
+                head=ROBOT_FACE_SCRIPT,
+            )
             return
         except OSError as e:
             print(f"Port {port} unavailable ({e}); trying {port + 1}...")
