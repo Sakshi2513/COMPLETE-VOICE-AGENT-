@@ -1,0 +1,27 @@
+# Core - always required
+python-dotenv
+requests
+soundfile
+torch
+transformers
+gradio
+
+# LLM brain - only one of these is actually used at runtime (whichever
+# LLM_PROVIDER is set to in .env), but installing both is harmless and
+# saves a re-install if you switch providers later.
+google-generativeai   # LLM_PROVIDER=gemini (see the FutureWarning note below)
+# grok (xAI) is called via plain `requests`, no extra SDK needed.
+
+# Optional - only used if present, code degrades gracefully without them:
+librosa               # resamples mic audio to 16kHz for Whisper if the
+                       # input isn't already 16kHz; skipped silently if
+                       # this isn't installed (see transcribe() in main.py)
+sounddevice           # only needed for `--mode terminal` (real mic/speaker
+                       # access); not needed for the default `--mode gradio`
+                       # (browser mic instead) - and won't work at all
+                       # inside a headless container either way
+
+# NOTE: google-generativeai is deprecated upstream in favor of
+# google-genai. It still works as pinned here, but if you want to move
+# off it later, swap this line for `google-genai` and update
+# _chat_gemini() in main.py accordingly.
